@@ -4,33 +4,42 @@
 package uk.co.coinfloor.client;
 
 import java.awt.AWTEvent;
-import java.awt.BorderLayout;
 import java.awt.CardLayout;
 import java.awt.Component;
 import java.awt.Cursor;
 import java.awt.EventQueue;
 import java.awt.GridLayout;
+import java.awt.LayoutManager;
 import java.awt.event.ActionEvent;
 import java.awt.event.ActionListener;
 import java.awt.event.InputEvent;
+import java.beans.PropertyChangeEvent;
+import java.beans.PropertyChangeListener;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
-import java.net.URI;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashMap;
+import java.util.EventListener;
 import java.util.ListIterator;
 import java.util.Map;
 import java.util.Timer;
 import java.util.TimerTask;
+import java.util.concurrent.Callable;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import javax.swing.BorderFactory;
 import javax.swing.ButtonGroup;
 import javax.swing.GroupLayout;
 import javax.swing.GroupLayout.Alignment;
 import javax.swing.GroupLayout.Group;
+import javax.swing.GroupLayout.ParallelGroup;
+import javax.swing.GroupLayout.SequentialGroup;
 import javax.swing.JButton;
+import javax.swing.JCheckBox;
+import javax.swing.JComboBox;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.JOptionPane;
@@ -55,6 +64,7 @@ import javax.swing.event.ListSelectionListener;
 import javax.swing.table.AbstractTableModel;
 import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.TableColumnModel;
+import javax.swing.text.JTextComponent;
 
 import uk.co.coinfloor.api.Callback;
 import uk.co.coinfloor.api.Coinfloor;
@@ -64,6 +74,28 @@ import uk.co.coinfloor.api.Coinfloor.TickerInfo;
 
 @SuppressWarnings("serial")
 public class SwingClient extends JPanel {
+
+	interface BalanceListener extends EventListener {
+
+		void balanceChanged(AssetType assetType, long balance);
+
+	}
+
+	interface OrderListener extends EventListener {
+
+		void orderOpened(long id, boolean own, AssetType base, AssetType counter, long quantity, long price);
+
+		void orderMatched(long id, boolean own, AssetType base, AssetType counter, long quantity, long remaining);
+
+		void orderClosed(long id, boolean own, AssetType base, AssetType counter, long quantity, long price);
+
+	}
+
+	interface TickerListener extends EventListener {
+
+		void tickerChanged(AssetType base, AssetType counter, long last, long bid, long ask, long low, long high, long volume);
+
+	}
 
 	static abstract class SwingCallback<V> implements Callback<V> {
 
@@ -107,7 +139,103 @@ public class SwingClient extends JPanel {
 
 	}
 
-	class TickerPanel extends JPanel {
+	static abstract class SwingTask<V> extends SwingCallback<V> implements Callable<V> {
+
+		private transient Cursor origCursor;
+
+		SwingTask(Component parent, String errorPreamble) {
+			super(parent, errorPreamble);
+		}
+
+		final void execute(Executor executor) {
+			if (SwingUtilities.isEventDispatchThread()) {
+				before();
+			}
+			else {
+				SwingUtilities.invokeLater(new Runnable() {
+
+					@Override
+					public void run() {
+						before();
+					}
+
+				});
+			}
+			executor.execute(new Runnable() {
+
+				@Override
+				public void run() {
+					try {
+						V result;
+						try {
+							result = call();
+						}
+						catch (Exception e) {
+							operationFailed(e);
+							return;
+						}
+						operationCompleted(result);
+					}
+					finally {
+						SwingUtilities.invokeLater(new Runnable() {
+
+							@Override
+							public void run() {
+								after();
+							}
+
+						});
+					}
+				}
+
+			});
+		}
+
+		void before() {
+			origCursor = parent.getCursor();
+			parent.setCursor(Cursor.getPredefinedCursor(Cursor.WAIT_CURSOR));
+		}
+
+		@Override
+		void completed(V result) {
+		}
+
+		void after() {
+			parent.setCursor(origCursor);
+		}
+
+	}
+
+	abstract class MarketPanel extends JPanel implements PropertyChangeListener {
+
+		MarketPanel(LayoutManager layout) {
+			super(layout);
+		}
+
+		@Override
+		public void addNotify() {
+			super.addNotify();
+			SwingClient.this.addPropertyChangeListener("market", this);
+		}
+
+		@Override
+		public void removeNotify() {
+			SwingClient.this.removePropertyChangeListener("market", this);
+			super.removeNotify();
+		}
+
+		@Override
+		public void propertyChange(PropertyChangeEvent evt) {
+			if (evt.getPropertyName() == "market") {
+				marketChanged((AssetType.Pair) evt.getOldValue(), (AssetType.Pair) evt.getNewValue());
+			}
+		}
+
+		abstract void marketChanged(AssetType.Pair oldMarket, AssetType.Pair newMarket);
+
+	}
+
+	class TickerPanel extends MarketPanel implements TickerListener {
 
 		final JLabel lastLabel, bidLabel, askLabel, lowLabel, highLabel, volumeLabel;
 
@@ -147,18 +275,78 @@ public class SwingClient extends JPanel {
 			add(volumeLabel);
 		}
 
-		void update(long last, long bid, long ask, long low, long high, long volume) {
-			lastLabel.setText(last < 0 ? "\u2014" : counter.symbol + BigDecimal.valueOf(last, counter.scale));
-			bidLabel.setText(bid < 0 ? "\u2014" : counter.symbol + BigDecimal.valueOf(bid, counter.scale));
-			askLabel.setText(ask < 0 ? "\u2014" : counter.symbol + BigDecimal.valueOf(ask, counter.scale));
-			lowLabel.setText(low < 0 ? "\u2014" : counter.symbol + BigDecimal.valueOf(low, counter.scale));
-			highLabel.setText(high < 0 ? "\u2014" : counter.symbol + BigDecimal.valueOf(high, counter.scale));
-			volumeLabel.setText(volume < 0 ? "\u2014" : base.symbol + BigDecimal.valueOf(volume, base.scale));
+		@Override
+		public void addNotify() {
+			super.addNotify();
+			addTickerListener(this);
+		}
+
+		@Override
+		public void removeNotify() {
+			removeTickerListener(this);
+			super.removeNotify();
+		}
+
+		@Override
+		public void tickerChanged(AssetType base, AssetType counter, long last, long bid, long ask, long low, long high, long volume) {
+			if (base == market.base && counter == market.counter) {
+				lastLabel.setText(last < 0 ? "\u2014" : counter.format(BigDecimal.valueOf(last, counter.scale)));
+				bidLabel.setText(bid < 0 ? "\u2014" : counter.format(BigDecimal.valueOf(bid, counter.scale)));
+				askLabel.setText(ask < 0 ? "\u2014" : counter.format(BigDecimal.valueOf(ask, counter.scale)));
+				lowLabel.setText(low < 0 ? "\u2014" : counter.format(BigDecimal.valueOf(low, counter.scale)));
+				highLabel.setText(high < 0 ? "\u2014" : counter.format(BigDecimal.valueOf(high, counter.scale)));
+				volumeLabel.setText(volume < 0 ? "\u2014" : base.format(BigDecimal.valueOf(volume, base.scale)));
+			}
+		}
+
+		void reset() {
+			lastLabel.setText("\u2014");
+			bidLabel.setText("\u2014");
+			askLabel.setText("\u2014");
+			lowLabel.setText("\u2014");
+			highLabel.setText("\u2014");
+			volumeLabel.setText("\u2014");
+		}
+
+		@Override
+		void marketChanged(AssetType.Pair oldMarket, AssetType.Pair newMarket) {
+			if (oldMarket != null) {
+				unsubscribe(oldMarket);
+			}
+			if (newMarket != null) {
+				subscribe(newMarket);
+			}
+		}
+
+		void subscribe(final AssetType.Pair market) {
+			SwingCallback<TickerInfo> callback = new SwingCallback<TickerInfo>(SwingClient.this, "Failed to subscribe to ticker.") {
+
+				@Override
+				void completed(TickerInfo ticker) {
+					tickerChanged(market.base, market.counter, ticker.last, ticker.bid, ticker.ask, ticker.low, ticker.high, ticker.volume);
+				}
+
+			};
+			try {
+				coinfloor.watchTickerAsync(market.base.code, market.counter.code, true, callback);
+			}
+			catch (IOException e) {
+				callback.failed(e);
+			}
+		}
+
+		void unsubscribe(AssetType.Pair market) {
+			reset();
+			try {
+				coinfloor.watchTickerAsync(market.base.code, market.counter.code, false);
+			}
+			catch (IOException ignored) {
+			}
 		}
 
 	}
 
-	class BalancesPanel extends JPanel {
+	class BalancesPanel extends MarketPanel implements BalanceListener {
 
 		final JLabel baseBalanceLabel, counterBalanceLabel;
 
@@ -169,18 +357,81 @@ public class SwingClient extends JPanel {
 			add(baseBalanceLabel = new JLabel("\u2014", SwingConstants.CENTER));
 		}
 
-		void update(AssetType assetType, long balance) {
+		@Override
+		public void addNotify() {
+			super.addNotify();
+			addBalanceListener(this);
+			SwingClient.this.addPropertyChangeListener("authenticated", this);
+		}
+
+		@Override
+		public void removeNotify() {
+			SwingClient.this.removePropertyChangeListener("authenticated", this);
+			removeBalanceListener(this);
+			super.removeNotify();
+		}
+
+		@Override
+		public void balanceChanged(AssetType assetType, long balance) {
 			JLabel label;
-			if (assetType == base) {
+			if (assetType == market.base) {
 				label = baseBalanceLabel;
 			}
-			else if (assetType == counter) {
+			else if (assetType == market.counter) {
 				label = counterBalanceLabel;
 			}
 			else {
 				return;
 			}
-			label.setText(assetType.symbol + BigDecimal.valueOf(balance, assetType.scale));
+			label.setText(balance < 0 ? "\u2014" : assetType.format(BigDecimal.valueOf(balance, assetType.scale)));
+		}
+
+		@Override
+		public void propertyChange(PropertyChangeEvent evt) {
+			super.propertyChange(evt);
+			if (evt.getPropertyName() == "authenticated" && (Boolean) evt.getNewValue()) {
+				subscribe(market);
+			}
+		}
+
+		void reset() {
+			baseBalanceLabel.setText("\u2014");
+			counterBalanceLabel.setText("\u2014");
+		}
+
+		@Override
+		void marketChanged(AssetType.Pair oldMarket, AssetType.Pair newMarket) {
+			if (oldMarket != null) {
+				unsubscribe(oldMarket);
+			}
+			if (newMarket != null) {
+				subscribe(newMarket);
+			}
+		}
+
+		void subscribe(AssetType.Pair market) {
+			if (authenticated) {
+				SwingCallback<Map<Integer, Long>> callback = new SwingCallback<Map<Integer, Long>>(this, "Failed to retrieve balances.") {
+
+					@Override
+					void completed(Map<Integer, Long> balances) {
+						for (Map.Entry<Integer, Long> entry : balances.entrySet()) {
+							balanceChanged(AssetType.forCode(entry.getKey()), entry.getValue());
+						}
+					}
+
+				};
+				try {
+					coinfloor.getBalancesAsync(callback);
+				}
+				catch (IOException e) {
+					callback.failed(e);
+				}
+			}
+		}
+
+		void unsubscribe(AssetType.Pair market) {
+			reset();
 		}
 
 	}
@@ -227,55 +478,26 @@ public class SwingClient extends JPanel {
 					}
 					String passphrase = new String(passphraseField.getPassword());
 					authenticateButton.setEnabled(false);
+					SwingCallback<Void> callback = new SwingCallback<Void>(AuthPanel.this, "Authentication failed.") {
+
+						@Override
+						void completed(Void result) {
+							setAuthenticated(true);
+							cardLayout.next(cardPanel);
+						}
+
+						@Override
+						void failed(Exception exception) {
+							authenticateButton.setEnabled(true);
+							super.failed(exception);
+						}
+
+					};
 					try {
-						coinfloor.authenticateAsync(userID, cookie, passphrase, new SwingCallback<Void>(AuthPanel.this, "Authentication failed.") {
-
-							@Override
-							void completed(Void result) {
-								cardLayout.next(cardPanel);
-								try {
-									coinfloor.getBalancesAsync(new SwingCallback<Map<Integer, Long>>(AuthPanel.this, "Failed to retrieve balances.") {
-
-										@Override
-										void completed(Map<Integer, Long> balances) {
-											for (Map.Entry<Integer, Long> entry : balances.entrySet()) {
-												balancesPanel.update(AssetType.forCode(entry.getKey()), entry.getValue());
-											}
-										}
-
-									});
-								}
-								catch (IOException e) {
-									JOptionPane.showMessageDialog(AuthPanel.this, "Failed to retrieve balances.\n\n" + e, "Error", JOptionPane.WARNING_MESSAGE);
-								}
-								try {
-									coinfloor.getOrdersAsync(new SwingCallback<Map<Long, OrderInfo>>(SwingClient.this, "Failed to retrieve orders.") {
-
-										@Override
-										void completed(Map<Long, OrderInfo> orders) {
-											for (Map.Entry<Long, OrderInfo> entry : orders.entrySet()) {
-												OrderInfo info = entry.getValue();
-												tradePanel.myOrdersPanel.addOrder(entry.getKey(), info.price, info.quantity, 0, info.quantity);
-											}
-										}
-
-									});
-								}
-								catch (IOException e) {
-									JOptionPane.showMessageDialog(AuthPanel.this, "Failed to retrieve orders.\n\n" + e, "Error", JOptionPane.WARNING_MESSAGE);
-								}
-							}
-
-							@Override
-							void failed(Exception exception) {
-								authenticateButton.setEnabled(true);
-								super.failed(exception);
-							}
-
-						});
+						coinfloor.authenticateAsync(userID, cookie, passphrase, callback);
 					}
 					catch (IOException e) {
-						JOptionPane.showMessageDialog(AuthPanel.this, "Failed to send authentication.\n\n" + e, "Error", JOptionPane.WARNING_MESSAGE);
+						callback.failed(e);
 					}
 				}
 
@@ -371,12 +593,14 @@ public class SwingClient extends JPanel {
 
 	}
 
-	class MarketOrderPanel extends JPanel {
+	class MarketOrderPanel extends MarketPanel {
 
 		final Timer timer = new Timer(true);
 
 		final JRadioButton buyRadioButton, sellRadioButton, spendRadioButton, getRadioButton;
+		final JLabel amountLabel, amountSymbolLabel;
 		final JTextField amountField;
+		final JLabel estimatedQuantityLabelLabel, estimatedTotalLabelLabel, averagePriceLabelLabel;
 		final JLabel estimatedQuantityLabel, estimatedTotalLabel, averagePriceLabel;
 		final JButton executeButton;
 
@@ -397,15 +621,15 @@ public class SwingClient extends JPanel {
 			getRadioButton.setOpaque(false);
 			buyRadioButton.setSelected(true);
 
-			final JLabel amountLabel = new JLabel("Quantity:");
-			final JLabel amountSymbolLabel = new JLabel(base.symbol);
+			amountLabel = new JLabel("Quantity:");
+			amountSymbolLabel = new JLabel();
 			amountLabel.setLabelFor(amountField = new JTextField(10));
 
-			JLabel estimatedQuantityLabelLabel = new JLabel("Estimated Quantity:");
+			estimatedQuantityLabelLabel = new JLabel("Estimated Quantity:");
 			estimatedQuantityLabelLabel.setLabelFor(estimatedQuantityLabel = new JLabel("\u2014"));
-			JLabel estimatedTotalLabelLabel = new JLabel("Estimated Total:");
+			estimatedTotalLabelLabel = new JLabel("Estimated Total:");
 			estimatedTotalLabelLabel.setLabelFor(estimatedTotalLabel = new JLabel("\u2014"));
-			JLabel averagePriceLabelLabel = new JLabel("Average Price:");
+			averagePriceLabelLabel = new JLabel("Average Price:");
 			averagePriceLabelLabel.setLabelFor(averagePriceLabel = new JLabel("\u2014"));
 
 			executeButton = new JButton("Execute");
@@ -415,15 +639,7 @@ public class SwingClient extends JPanel {
 
 				@Override
 				public void actionPerformed(ActionEvent e) {
-					if (buyRadioButton.isSelected() || sellRadioButton.isSelected()) {
-						amountLabel.setText("Quantity:");
-						amountSymbolLabel.setText(base.symbol);
-					}
-					else if (spendRadioButton.isSelected() || getRadioButton.isSelected()) {
-						amountLabel.setText("Total:");
-						amountSymbolLabel.setText(counter.symbol);
-					}
-					inputChanged();
+					update();
 				}
 
 			};
@@ -455,7 +671,7 @@ public class SwingClient extends JPanel {
 
 				@Override
 				public void actionPerformed(ActionEvent event) {
-					BigDecimal amount = new BigDecimal(amountField.getText());
+					BigDecimal amount = getAmount(amountField);
 					SwingCallback<Long> callback = new SwingCallback<Long>(MarketOrderPanel.this, "Failed to execute market order.") {
 
 						@Override
@@ -466,29 +682,35 @@ public class SwingClient extends JPanel {
 					};
 					executeButton.setEnabled(false);
 					try {
+						AssetType base = market.base, counter = market.counter;
 						if (buyRadioButton.isSelected()) {
-							coinfloor.executeBaseMarketOrderAsync(base.code, counter.code, amount.movePointRight(base.scale).longValue(), callback);
+							coinfloor.executeBaseMarketOrderAsync(base.code, counter.code, amount.movePointRight(base.scale).longValue(), 0, callback);
 						}
 						else if (sellRadioButton.isSelected()) {
-							coinfloor.executeBaseMarketOrderAsync(base.code, counter.code, -amount.movePointRight(base.scale).longValue(), callback);
+							coinfloor.executeBaseMarketOrderAsync(base.code, counter.code, -amount.movePointRight(base.scale).longValue(), 0, callback);
 						}
 						else if (spendRadioButton.isSelected()) {
-							coinfloor.executeCounterMarketOrderAsync(base.code, counter.code, amount.movePointRight(counter.scale).longValue(), callback);
+							coinfloor.executeCounterMarketOrderAsync(base.code, counter.code, amount.movePointRight(counter.scale).longValue(), 0, callback);
 						}
 						else if (getRadioButton.isSelected()) {
-							coinfloor.executeCounterMarketOrderAsync(base.code, counter.code, -amount.movePointRight(counter.scale).longValue(), callback);
+							coinfloor.executeCounterMarketOrderAsync(base.code, counter.code, -amount.movePointRight(counter.scale).longValue(), 0, callback);
 						}
 					}
 					catch (IOException e) {
-						JOptionPane.showMessageDialog(MarketOrderPanel.this, "Failed to execute market order.\n\n" + e, "Error", JOptionPane.WARNING_MESSAGE);
+						callback.failed(e);
 					}
 				}
 
 			});
 
+			updateLayout(null);
+		}
+
+		void updateLayout(AssetType amountAsset) {
 			GroupLayout layout = new GroupLayout(this);
 			layout.setAutoCreateContainerGaps(true);
 			layout.setAutoCreateGaps(true);
+			SequentialGroup amountHGroup;
 			// @formatter:off
 			layout.setHorizontalGroup(layout.createSequentialGroup()
 					.addGroup(layout.createParallelGroup(Alignment.TRAILING)
@@ -499,9 +721,7 @@ public class SwingClient extends JPanel {
 									.addComponent(getRadioButton))
 							.addGroup(layout.createSequentialGroup()
 									.addComponent(amountLabel)
-									.addComponent(amountSymbolLabel)
-									.addGap(0)
-									.addComponent(amountField, GroupLayout.DEFAULT_SIZE, GroupLayout.DEFAULT_SIZE, GroupLayout.PREFERRED_SIZE)))
+									.addGroup(amountHGroup = layout.createSequentialGroup())))
 					.addPreferredGap(ComponentPlacement.UNRELATED, GroupLayout.DEFAULT_SIZE, Integer.MAX_VALUE)
 					.addGroup(layout.createSequentialGroup()
 							.addGroup(layout.createParallelGroup(Alignment.TRAILING)
@@ -537,6 +757,12 @@ public class SwingClient extends JPanel {
 									.addComponent(averagePriceLabel)))
 					.addComponent(executeButton));
 			// @formatter:on
+			if (amountAsset != null && amountAsset.symbolAfter) {
+				amountHGroup.addComponent(amountField, GroupLayout.DEFAULT_SIZE, GroupLayout.DEFAULT_SIZE, GroupLayout.PREFERRED_SIZE).addGap(0).addComponent(amountSymbolLabel);
+			}
+			else {
+				amountHGroup.addComponent(amountSymbolLabel).addGap(0).addComponent(amountField, GroupLayout.DEFAULT_SIZE, GroupLayout.DEFAULT_SIZE, GroupLayout.PREFERRED_SIZE);
+			}
 			setLayout(layout);
 		}
 
@@ -549,33 +775,27 @@ public class SwingClient extends JPanel {
 			estimatedTotalLabel.setText("\u2014");
 			averagePriceLabel.setText("\u2014");
 			executeButton.setEnabled(false);
-			String amountStr = amountField.getText();
-			BigDecimal amountBig;
-			try {
-				if (amountStr.isEmpty() || (amountBig = new BigDecimal(amountStr)).signum() < 0) {
-					return;
-				}
-			}
-			catch (Exception e) {
+			BigDecimal amountBig = getAmount(amountField);
+			if (amountBig == null || amountBig.signum() <= 0) {
 				return;
 			}
 			final boolean useBase;
 			final long amount;
 			if (buyRadioButton.isSelected()) {
 				useBase = true;
-				amount = amountBig.movePointRight(base.scale).longValue();
+				amount = amountBig.movePointRight(market.base.scale).longValue();
 			}
 			else if (sellRadioButton.isSelected()) {
 				useBase = true;
-				amount = -amountBig.movePointRight(base.scale).longValue();
+				amount = -amountBig.movePointRight(market.base.scale).longValue();
 			}
 			else if (spendRadioButton.isSelected()) {
 				useBase = false;
-				amount = amountBig.movePointRight(counter.scale).longValue();
+				amount = amountBig.movePointRight(market.counter.scale).longValue();
 			}
 			else if (getRadioButton.isSelected()) {
 				useBase = false;
-				amount = -amountBig.movePointRight(counter.scale).longValue();
+				amount = -amountBig.movePointRight(market.counter.scale).longValue();
 			}
 			else {
 				return;
@@ -589,12 +809,13 @@ public class SwingClient extends JPanel {
 
 						@Override
 						void completed(MarketOrderEstimate estimate) {
+							AssetType base = market.base, counter = market.counter;
 							BigDecimal estimatedQuantity = BigDecimal.valueOf(estimate.quantity, base.scale);
-							estimatedQuantityLabel.setText(base.symbol + estimatedQuantity);
+							estimatedQuantityLabel.setText(base.format(estimatedQuantity));
 							BigDecimal estimatedTotal = BigDecimal.valueOf(estimate.total, counter.scale);
-							estimatedTotalLabel.setText(counter.symbol + estimatedTotal);
+							estimatedTotalLabel.setText(counter.format(estimatedTotal));
 							BigDecimal averagePrice = estimatedTotal.divide(estimatedQuantity, counter.scale, RoundingMode.HALF_EVEN);
-							averagePriceLabel.setText(counter.symbol + averagePrice);
+							averagePriceLabel.setText(counter.format(averagePrice));
 						}
 
 						@Override
@@ -605,10 +826,10 @@ public class SwingClient extends JPanel {
 					};
 					try {
 						if (useBase) {
-							coinfloor.estimateBaseMarketOrderAsync(base.code, counter.code, amount, callback);
+							coinfloor.estimateBaseMarketOrderAsync(market.base.code, market.counter.code, amount, callback);
 						}
 						else {
-							coinfloor.estimateCounterMarketOrderAsync(base.code, counter.code, amount, callback);
+							coinfloor.estimateCounterMarketOrderAsync(market.base.code, market.counter.code, amount, callback);
 						}
 					}
 					catch (IOException ignored) {
@@ -618,12 +839,35 @@ public class SwingClient extends JPanel {
 			}, 1000, 5000);
 		}
 
+		@Override
+		void marketChanged(AssetType.Pair oldMarket, AssetType.Pair newMarket) {
+			update();
+		}
+
+		void update() {
+			AssetType amountAsset = null;
+			if (buyRadioButton.isSelected() || sellRadioButton.isSelected()) {
+				amountLabel.setText("Quantity:");
+				amountSymbolLabel.setText((amountAsset = market.base).symbol);
+			}
+			else if (spendRadioButton.isSelected() || getRadioButton.isSelected()) {
+				amountLabel.setText("Total:");
+				amountSymbolLabel.setText((amountAsset = market.counter).symbol);
+			}
+			amountField.setText(null);
+			updateLayout(amountAsset);
+			inputChanged();
+		}
+
 	}
 
-	class LimitOrderPanel extends JPanel {
+	class LimitOrderPanel extends MarketPanel {
 
 		final JRadioButton bidRadioButton, askRadioButton;
+		final JLabel priceLabel, quantityLabel;
+		final JLabel priceSymbolLabel, quantitySymbolLabel;
 		final JTextField priceField, quantityField;
+		final JCheckBox cancelOnDisconnectCheckBox;
 		final JButton submitButton;
 
 		LimitOrderPanel() {
@@ -637,13 +881,15 @@ public class SwingClient extends JPanel {
 			askRadioButton.setOpaque(false);
 			bidRadioButton.setSelected(true);
 
-			JLabel priceLabel = new JLabel("Price:");
-			JLabel priceSymbolLabel = new JLabel(counter.symbol);
+			priceLabel = new JLabel("Price:");
+			priceSymbolLabel = new JLabel();
 			priceLabel.setLabelFor(priceField = new JTextField(10));
 
-			JLabel quantityLabel = new JLabel("Quantity:");
-			JLabel quantitySymbolLabel = new JLabel(base.symbol);
+			quantityLabel = new JLabel("Quantity:");
+			quantitySymbolLabel = new JLabel();
 			quantityLabel.setLabelFor(quantityField = new JTextField(10));
+
+			cancelOnDisconnectCheckBox = new JCheckBox("Cancel order on disconnect");
 
 			submitButton = new JButton("Submit");
 			submitButton.setEnabled(false);
@@ -673,7 +919,7 @@ public class SwingClient extends JPanel {
 
 				@Override
 				public void actionPerformed(ActionEvent event) {
-					long quantity = new BigDecimal(quantityField.getText()).movePointRight(base.scale).longValue();
+					long quantity = getAmount(quantityField).movePointRight(market.base.scale).longValue();
 					final long fQuantity;
 					if (bidRadioButton.isSelected()) {
 						fQuantity = quantity;
@@ -684,7 +930,7 @@ public class SwingClient extends JPanel {
 					else {
 						return;
 					}
-					final long price = new BigDecimal(priceField.getText()).movePointRight(counter.scale).longValue();
+					final long price = getAmount(priceField).movePointRight(market.counter.scale).longValue();
 					SwingCallback<Long> callback = new SwingCallback<Long>(LimitOrderPanel.this, "Failed to submit limit order.") {
 
 						@Override
@@ -695,33 +941,30 @@ public class SwingClient extends JPanel {
 					};
 					submitButton.setEnabled(false);
 					try {
-						coinfloor.placeLimitOrderAsync(base.code, counter.code, fQuantity, price, callback);
+						coinfloor.placeLimitOrderAsync(market.base.code, market.counter.code, fQuantity, price, 0, !cancelOnDisconnectCheckBox.isSelected(), callback);
 					}
 					catch (IOException e) {
-						JOptionPane.showMessageDialog(LimitOrderPanel.this, "Failed to submit limit order.\n\n" + e, "Error", JOptionPane.WARNING_MESSAGE);
+						callback.failed(e);
 					}
 				}
 
 			});
 
+			updateLayout();
+		}
+
+		void updateLayout() {
 			GroupLayout layout = new GroupLayout(this);
 			layout.setAutoCreateContainerGaps(true);
 			layout.setAutoCreateGaps(true);
+			SequentialGroup priceHGroup, quantityHGroup;
 			// @formatter:off
 			layout.setHorizontalGroup(layout.createSequentialGroup()
 					.addComponent(priceLabel)
-					.addComponent(priceSymbolLabel)
-					.addGap(0)
-					.addGroup(layout.createParallelGroup(Alignment.CENTER)
-							.addGroup(layout.createSequentialGroup()
-									.addComponent(bidRadioButton)
-									.addComponent(askRadioButton))
-							.addComponent(priceField, GroupLayout.DEFAULT_SIZE, GroupLayout.DEFAULT_SIZE, GroupLayout.PREFERRED_SIZE))
-					.addComponent(quantityLabel)
-					.addComponent(quantitySymbolLabel)
-					.addGap(0)
-					.addComponent(quantityField, GroupLayout.DEFAULT_SIZE, GroupLayout.DEFAULT_SIZE, GroupLayout.PREFERRED_SIZE)
+					.addGroup(priceHGroup = layout.createSequentialGroup())
 					.addPreferredGap(ComponentPlacement.UNRELATED)
+					.addComponent(quantityLabel)
+					.addGroup(quantityHGroup = layout.createSequentialGroup())
 					.addPreferredGap(ComponentPlacement.UNRELATED, GroupLayout.DEFAULT_SIZE, Integer.MAX_VALUE)
 					.addComponent(submitButton));
 			layout.setVerticalGroup(layout.createParallelGroup(Alignment.CENTER)
@@ -737,30 +980,48 @@ public class SwingClient extends JPanel {
 									.addComponent(quantitySymbolLabel)
 									.addComponent(quantityField)))
 					.addComponent(submitButton));
+			ParallelGroup priceFieldHGroup = layout.createParallelGroup(Alignment.CENTER)
+					.addGroup(layout.createSequentialGroup()
+							.addComponent(bidRadioButton)
+							.addComponent(askRadioButton))
+					.addComponent(priceField, GroupLayout.DEFAULT_SIZE, GroupLayout.DEFAULT_SIZE, GroupLayout.PREFERRED_SIZE);
 			// @formatter:on
+			if (market != null && market.counter.symbolAfter) {
+				priceHGroup.addGroup(priceFieldHGroup).addGap(0).addComponent(priceSymbolLabel);
+			}
+			else {
+				priceHGroup.addComponent(priceSymbolLabel).addGap(0).addGroup(priceFieldHGroup);
+			}
+			if (market != null && market.base.symbolAfter) {
+				quantityHGroup.addComponent(quantityField, GroupLayout.DEFAULT_SIZE, GroupLayout.DEFAULT_SIZE, GroupLayout.PREFERRED_SIZE).addGap(0).addComponent(quantitySymbolLabel);
+			}
+			else {
+				quantityHGroup.addComponent(quantitySymbolLabel).addGap(0).addComponent(quantityField, GroupLayout.DEFAULT_SIZE, GroupLayout.DEFAULT_SIZE, GroupLayout.PREFERRED_SIZE);
+			}
 			setLayout(layout);
 		}
 
 		void inputChanged() {
 			submitButton.setEnabled(false);
-			String quantityStr = quantityField.getText(), priceStr = priceField.getText();
-			try {
-				if (quantityStr.isEmpty() || new BigDecimal(quantityStr).signum() < 0) {
-					return;
-				}
-				if (priceStr.isEmpty() || new BigDecimal(priceStr).signum() < 0) {
-					return;
-				}
-			}
-			catch (Exception e) {
+			BigDecimal quantity, price;
+			if ((quantity = getAmount(quantityField)) == null || quantity.signum() < 0 || (price = getAmount(priceField)) == null || price.signum() < 0) {
 				return;
 			}
 			submitButton.setEnabled(true);
 		}
 
+		@Override
+		void marketChanged(AssetType.Pair oldMarket, AssetType.Pair newMarket) {
+			priceSymbolLabel.setText(newMarket.counter.symbol);
+			priceField.setText(null);
+			quantitySymbolLabel.setText(newMarket.base.symbol);
+			quantityField.setText(null);
+			updateLayout();
+		}
+
 	}
 
-	class OrdersPanel extends JPanel {
+	class OrdersPanel extends MarketPanel implements OrderListener {
 
 		final OrdersTable bidsTable, asksTable;
 
@@ -791,11 +1052,11 @@ public class SwingClient extends JPanel {
 			layout.setHorizontalGroup(horizontalGroup = layout.createSequentialGroup()
 					.addGroup(layout.createParallelGroup(Alignment.CENTER)
 							.addComponent(bidsLabel)
-							.addComponent(bidsTableScrollPane, GroupLayout.DEFAULT_SIZE, 300, GroupLayout.DEFAULT_SIZE))
+							.addComponent(bidsTableScrollPane, GroupLayout.DEFAULT_SIZE, 400, GroupLayout.DEFAULT_SIZE))
 					.addPreferredGap(ComponentPlacement.UNRELATED)
 					.addGroup(layout.createParallelGroup(Alignment.CENTER)
 							.addComponent(asksLabel)
-							.addComponent(asksTableScrollPane, GroupLayout.DEFAULT_SIZE, 300, GroupLayout.DEFAULT_SIZE)));
+							.addComponent(asksTableScrollPane, GroupLayout.DEFAULT_SIZE, 400, GroupLayout.DEFAULT_SIZE)));
 			layout.setVerticalGroup(verticalGroup = layout.createSequentialGroup()
 					.addGroup(layout.createBaselineGroup(false, false)
 							.addComponent(bidsLabel)
@@ -805,6 +1066,39 @@ public class SwingClient extends JPanel {
 							.addComponent(asksTableScrollPane, GroupLayout.DEFAULT_SIZE, 200, GroupLayout.DEFAULT_SIZE)));
 			// @formatter:on
 			setLayout(layout);
+		}
+
+		@Override
+		public void addNotify() {
+			super.addNotify();
+			addOrderListener(this);
+		}
+
+		@Override
+		public void removeNotify() {
+			removeOrderListener(this);
+			super.removeNotify();
+		}
+
+		@Override
+		public void orderOpened(long id, boolean own, AssetType base, AssetType counter, long quantity, long price) {
+			if (base == market.base && counter == market.counter) {
+				addOrder(id, price, quantity, 0, quantity);
+			}
+		}
+
+		@Override
+		public void orderMatched(long id, boolean own, AssetType base, AssetType counter, long quantity, long remaining) {
+			if (base == market.base && counter == market.counter) {
+				updateOrder(id, quantity, remaining);
+			}
+		}
+
+		@Override
+		public void orderClosed(long id, boolean own, AssetType base, AssetType counter, long quantity, long price) {
+			if (base == market.base && counter == market.counter) {
+				removeOrder(id);
+			}
 		}
 
 		void addOrder(long id, long price, long quantity, long filled, long remaining) {
@@ -856,7 +1150,7 @@ public class SwingClient extends JPanel {
 		}
 
 		private Long removeOrder(OrdersTable table, long id) {
-			OrdersTableModel model = (OrdersTableModel) table.getModel();
+			OrdersTableModel model = table.getModel();
 			for (ListIterator<Order> it = model.orders.listIterator(); it.hasNext();) {
 				Order order = it.next();
 				if (order.id == id) {
@@ -869,13 +1163,62 @@ public class SwingClient extends JPanel {
 			return null;
 		}
 
+		void removeAllOrders() {
+			removeAllOrders(bidsTable);
+			removeAllOrders(asksTable);
+		}
+
+		private void removeAllOrders(OrdersTable table) {
+			OrdersTableModel model = table.getModel();
+			model.orders.clear();
+			model.fireTableDataChanged();
+		}
+
+		@Override
+		void marketChanged(AssetType.Pair oldMarket, AssetType.Pair newMarket) {
+			if (oldMarket != null) {
+				unsubscribe(oldMarket);
+			}
+			if (newMarket != null) {
+				subscribe(newMarket);
+			}
+		}
+
+		void subscribe(AssetType.Pair market) {
+			SwingCallback<Map<Long, OrderInfo>> callback = new SwingCallback<Map<Long, OrderInfo>>(this, "Failed to subscribe to orders.") {
+
+				@Override
+				void completed(Map<Long, OrderInfo> orders) {
+					removeAllOrders();
+					for (Map.Entry<Long, OrderInfo> entry : orders.entrySet()) {
+						OrderInfo info = entry.getValue();
+						addOrder(entry.getKey(), info.price, info.quantity, 0, info.quantity);
+					}
+				}
+
+			};
+			try {
+				coinfloor.watchOrdersAsync(market.base.code, market.counter.code, true, callback);
+			}
+			catch (IOException e) {
+				callback.failed(e);
+			}
+		}
+
+		void unsubscribe(AssetType.Pair market) {
+			removeAllOrders();
+			try {
+				coinfloor.watchOrdersAsync(market.base.code, market.counter.code, false);
+			}
+			catch (IOException ignored) {
+			}
+		}
+
 	}
 
 	class MyOrdersPanel extends OrdersPanel {
 
-		final JButton cancelAllButton, cancelSelectedButton;
-
-		final HashMap<Long, long[]> cachedUpdates = new HashMap<Long, long[]>();
+		final JButton cancelAllButton, cancelSelectedButton, clearClosedButton;
 
 		long totalRemaining;
 
@@ -890,6 +1233,9 @@ public class SwingClient extends JPanel {
 
 			cancelSelectedButton = new JButton("Cancel Selected Orders");
 			cancelSelectedButton.setEnabled(false);
+
+			clearClosedButton = new JButton("Clear Closed Orders");
+			clearClosedButton.setEnabled(false);
 
 			ListSelectionListener selectionListener = new ListSelectionListener() {
 
@@ -913,30 +1259,20 @@ public class SwingClient extends JPanel {
 			cancelAllButton.addActionListener(new ActionListener() {
 
 				@Override
-				public void actionPerformed(ActionEvent e) {
-					cancelAll(bidsTable);
-					cancelAll(asksTable);
-				}
-
-				private void cancelAll(OrdersTable table) {
-					OrdersTableModel model = (OrdersTableModel) table.getModel();
-					SwingCallback<OrderInfo> callback = new SwingCallback<OrderInfo>(MyOrdersPanel.this, "Failed to cancel order.") {
+				public void actionPerformed(ActionEvent evt) {
+					SwingCallback<Map<Long, OrderInfo>> callback = new SwingCallback<Map<Long, OrderInfo>>(MyOrdersPanel.this, "Failed to cancel orders.") {
 
 						@Override
-						void completed(OrderInfo info) {
+						void completed(Map<Long, OrderInfo> info) {
 							// no-op
 						}
 
 					};
 					try {
-						for (Order order : model.orders) {
-							if (order.remaining > 0) {
-								coinfloor.cancelOrderAsync(order.id, callback);
-							}
-						}
+						coinfloor.cancelAllOrdersAsync(callback);
 					}
 					catch (IOException e) {
-						JOptionPane.showMessageDialog(MyOrdersPanel.this, "Failed to cancel order.\n\n" + e, "Error", JOptionPane.WARNING_MESSAGE);
+						callback.failed(e);
 					}
 				}
 
@@ -951,7 +1287,7 @@ public class SwingClient extends JPanel {
 				}
 
 				private void cancelSelected(OrdersTable table) {
-					OrdersTableModel model = (OrdersTableModel) table.getModel();
+					OrdersTableModel model = table.getModel();
 					SwingCallback<OrderInfo> callback = new SwingCallback<OrderInfo>(MyOrdersPanel.this, "Failed to cancel order.") {
 
 						@Override
@@ -972,36 +1308,100 @@ public class SwingClient extends JPanel {
 						}
 					}
 					catch (IOException e) {
-						JOptionPane.showMessageDialog(MyOrdersPanel.this, "Failed to cancel order.\n\n" + e, "Error", JOptionPane.WARNING_MESSAGE);
+						callback.failed(e);
 					}
+				}
+
+			});
+
+			clearClosedButton.addActionListener(new ActionListener() {
+
+				@Override
+				public void actionPerformed(ActionEvent e) {
+					clearClosed(bidsTable);
+					clearClosed(asksTable);
+					clearClosedButton.setEnabled(false);
+				}
+
+				private void clearClosed(OrdersTable table) {
+					OrdersTableModel model = table.getModel();
+					for (int i = 0, n = table.getRowCount(); i < n;) {
+						if (model.orders.get(i).remaining == 0) {
+							model.orders.remove(i);
+							--n;
+						}
+						else {
+							++i;
+						}
+					}
+					model.fireTableDataChanged();
 				}
 
 			});
 
 			GroupLayout layout = (GroupLayout) getLayout();
 			// @formatter:off
-			layout.setHorizontalGroup(horizontalGroup = layout.createParallelGroup()
+			layout.setHorizontalGroup(horizontalGroup = layout.createParallelGroup(Alignment.CENTER)
 					.addGroup(horizontalGroup)
 					.addGroup(layout.createSequentialGroup()
 							.addComponent(cancelAllButton)
-							.addPreferredGap(ComponentPlacement.UNRELATED, GroupLayout.DEFAULT_SIZE, Integer.MAX_VALUE)
-							.addComponent(cancelSelectedButton)));
+							.addPreferredGap(ComponentPlacement.UNRELATED)
+							.addComponent(cancelSelectedButton)
+							.addPreferredGap(ComponentPlacement.UNRELATED)
+							.addComponent(clearClosedButton)));
 			layout.setVerticalGroup(verticalGroup = layout.createSequentialGroup()
 					.addGroup(verticalGroup)
 					.addPreferredGap(ComponentPlacement.UNRELATED)
 					.addGroup(layout.createBaselineGroup(false, false)
 							.addComponent(cancelAllButton)
-							.addComponent(cancelSelectedButton)));
+							.addComponent(cancelSelectedButton)
+							.addComponent(clearClosedButton)));
 			// @formatter:on
 		}
 
 		@Override
-		void addOrder(long id, long price, long quantity, long filled, long remaining) {
-			long[] cachedUpdate = cachedUpdates.remove(id);
-			if (cachedUpdate != null) {
-				filled = cachedUpdate[0];
-				remaining = cachedUpdate[1];
+		public void addNotify() {
+			super.addNotify();
+			SwingClient.this.addPropertyChangeListener("authenticated", this);
+		}
+
+		@Override
+		public void removeNotify() {
+			SwingClient.this.removePropertyChangeListener("authenticated", this);
+			super.removeNotify();
+		}
+
+		@Override
+		public void orderOpened(long id, boolean own, AssetType base, AssetType counter, long quantity, long price) {
+			if (own) {
+				super.orderOpened(id, own, base, counter, quantity, price);
 			}
+		}
+
+		@Override
+		public void orderMatched(long id, boolean own, AssetType base, AssetType counter, long quantity, long remaining) {
+			if (own) {
+				super.orderMatched(id, own, base, counter, quantity, remaining);
+			}
+		}
+
+		@Override
+		public void orderClosed(long id, boolean own, AssetType base, AssetType counter, long quantity, long price) {
+			if (own) {
+				super.orderClosed(id, own, base, counter, quantity, price);
+			}
+		}
+
+		@Override
+		public void propertyChange(PropertyChangeEvent evt) {
+			super.propertyChange(evt);
+			if (evt.getPropertyName() == "authenticated" && (Boolean) evt.getNewValue()) {
+				subscribe(market);
+			}
+		}
+
+		@Override
+		void addOrder(long id, long price, long quantity, long filled, long remaining) {
 			super.addOrder(id, price, quantity, filled, remaining);
 			cancelAllButton.setEnabled((totalRemaining += Math.abs(remaining)) > 0);
 		}
@@ -1011,22 +1411,54 @@ public class SwingClient extends JPanel {
 			Long ret;
 			if ((ret = super.updateOrder(id, filledDelta, remaining)) != null) {
 				cancelAllButton.setEnabled((totalRemaining += Math.abs(remaining) - ret) > 0);
-				return ret;
+				if (remaining == 0) {
+					clearClosedButton.setEnabled(true);
+				}
 			}
-			long[] cachedUpdate = cachedUpdates.get(id);
-			if (cachedUpdate == null) {
-				cachedUpdates.put(id, new long[] { filledDelta, remaining });
-			}
-			else {
-				cachedUpdate[0] += filledDelta;
-				cachedUpdate[1] = remaining;
-			}
-			return null;
+			return ret;
 		}
 
 		@Override
 		Long removeOrder(long id) {
 			return updateOrder(id, 0, 0);
+		}
+
+		@Override
+		void removeAllOrders() {
+			super.removeAllOrders();
+			totalRemaining = 0;
+			cancelAllButton.setEnabled(false);
+		}
+
+		@Override
+		void subscribe(final AssetType.Pair market) {
+			if (authenticated) {
+				SwingCallback<Map<Long, OrderInfo>> callback = new SwingCallback<Map<Long, OrderInfo>>(this, "Failed to retrieve orders.") {
+
+					@Override
+					void completed(Map<Long, OrderInfo> orders) {
+						removeAllOrders();
+						for (Map.Entry<Long, OrderInfo> entry : orders.entrySet()) {
+							OrderInfo info = entry.getValue();
+							if (info.base == market.base.code && info.counter == market.counter.code) {
+								addOrder(entry.getKey(), info.price, info.quantity, 0, info.quantity);
+							}
+						}
+					}
+
+				};
+				try {
+					coinfloor.getOrdersAsync(callback);
+				}
+				catch (IOException e) {
+					callback.failed(e);
+				}
+			}
+		}
+
+		@Override
+		void unsubscribe(AssetType.Pair market) {
+			removeAllOrders();
 		}
 
 	}
@@ -1041,6 +1473,11 @@ public class SwingClient extends JPanel {
 			columnModel.getColumn(1).setCellRenderer(new QuantityRenderer());
 			columnModel.getColumn(2).setCellRenderer(new QuantityRenderer());
 			columnModel.getColumn(3).setCellRenderer(new QuantityRenderer());
+		}
+
+		@Override
+		public OrdersTableModel getModel() {
+			return (OrdersTableModel) super.getModel();
 		}
 
 	}
@@ -1105,7 +1542,7 @@ public class SwingClient extends JPanel {
 
 		@Override
 		public Component getTableCellRendererComponent(JTable table, Object value, boolean isSelected, boolean hasFocus, int row, int column) {
-			Component c = super.getTableCellRendererComponent(table, counter.symbol + BigDecimal.valueOf(((Number) value).longValue(), counter.scale - base.scale + 4), isSelected, hasFocus, row, column);
+			Component c = super.getTableCellRendererComponent(table, market.counter.format(BigDecimal.valueOf(((Number) value).longValue(), market.counter.scale - market.base.scale + 4)), isSelected, hasFocus, row, column);
 			c.setEnabled(((OrdersTableModel) table.getModel()).orders.get(table.convertRowIndexToModel(row)).remaining > 0);
 			return c;
 		}
@@ -1121,7 +1558,7 @@ public class SwingClient extends JPanel {
 		@Override
 		public Component getTableCellRendererComponent(JTable table, Object value, boolean isSelected, boolean hasFocus, int row, int column) {
 			long v = ((Number) value).longValue();
-			Component c = super.getTableCellRendererComponent(table, v == 0 ? "\u2014" : base.symbol + BigDecimal.valueOf(v, base.scale), isSelected, hasFocus, row, column);
+			Component c = super.getTableCellRendererComponent(table, v == 0 ? "\u2014" : market.base.format(BigDecimal.valueOf(v, market.base.scale)), isSelected, hasFocus, row, column);
 			c.setEnabled(((OrdersTableModel) table.getModel()).orders.get(table.convertRowIndexToModel(row)).remaining > 0);
 			return c;
 		}
@@ -1144,74 +1581,83 @@ public class SwingClient extends JPanel {
 
 	}
 
+	final ExecutorService executor = Executors.newSingleThreadExecutor();
 	final Coinfloor coinfloor = new Coinfloor() {
 
 		@Override
-		protected void balanceChanged(final int asset, final long balance) {
-			SwingUtilities.invokeLater(new Runnable() {
+		protected void balanceChanged(int asset, final long balance) {
+			final AssetType assetType;
+			if ((assetType = AssetType.forCode(asset)) != null) {
+				SwingUtilities.invokeLater(new Runnable() {
 
-				@Override
-				public void run() {
-					balancesPanel.update(AssetType.forCode(asset), balance);
-				}
-
-			});
-		}
-
-		@Override
-		protected void orderOpened(final long id, int base, int counter, final long quantity, final long price, long time) {
-			SwingUtilities.invokeLater(new Runnable() {
-
-				@Override
-				public void run() {
-					tradePanel.ordersPanel.addOrder(id, price, quantity, 0, quantity);
-				}
-
-			});
-		}
-
-		@Override
-		protected void ordersMatched(final long bid, final long ask, int base, int counter, final long quantity, long price, long total, final long bidRem, final long askRem, long time, final long bidBaseFee, long bidCounterFee, final long askBaseFee, long askCounterFee) {
-			SwingUtilities.invokeLater(new Runnable() {
-
-				@Override
-				public void run() {
-					if (bidBaseFee >= 0) {
-						tradePanel.myOrdersPanel.updateOrder(bid, quantity, bidRem);
+					@Override
+					public void run() {
+						fireBalanceChanged(assetType, balance);
 					}
-					if (askBaseFee >= 0) {
-						tradePanel.myOrdersPanel.updateOrder(ask, quantity, -askRem);
-					}
-					tradePanel.ordersPanel.updateOrder(bid, quantity, bidRem);
-					tradePanel.ordersPanel.updateOrder(ask, quantity, -askRem);
-				}
 
-			});
+				});
+			}
 		}
 
 		@Override
-		protected void orderClosed(final long id, int base, int counter, long quantity, long price) {
-			SwingUtilities.invokeLater(new Runnable() {
+		protected void orderOpened(final long id, long tonce, int base, int counter, final long quantity, final long price, long time, final boolean own) {
+			final AssetType baseAssetType, counterAssetType;
+			if ((baseAssetType = AssetType.forCode(base)) != null && (counterAssetType = AssetType.forCode(counter)) != null) {
+				SwingUtilities.invokeLater(new Runnable() {
 
-				@Override
-				public void run() {
-					tradePanel.myOrdersPanel.removeOrder(id);
-					tradePanel.ordersPanel.removeOrder(id);
-				}
+					@Override
+					public void run() {
+						fireOrderOpened(id, own, baseAssetType, counterAssetType, quantity, price);
+					}
 
-			});
+				});
+			}
+		}
+
+		@Override
+		protected void ordersMatched(final long bid, long bidTonce, final long ask, long askTonce, int base, int counter, final long quantity, long price, long total, final long bidRem, final long askRem, long time, final long bidBaseFee, long bidCounterFee, final long askBaseFee, long askCounterFee) {
+			final AssetType baseAssetType, counterAssetType;
+			if ((baseAssetType = AssetType.forCode(base)) != null && (counterAssetType = AssetType.forCode(counter)) != null) {
+				SwingUtilities.invokeLater(new Runnable() {
+
+					@Override
+					public void run() {
+						fireOrderMatched(bid, bidBaseFee >= 0, baseAssetType, counterAssetType, quantity, bidRem);
+						fireOrderMatched(ask, askBaseFee >= 0, baseAssetType, counterAssetType, quantity, -askRem);
+					}
+
+				});
+			}
+		}
+
+		@Override
+		protected void orderClosed(final long id, long tonce, int base, int counter, final long quantity, final long price, final boolean own) {
+			final AssetType baseAssetType, counterAssetType;
+			if ((baseAssetType = AssetType.forCode(base)) != null && (counterAssetType = AssetType.forCode(counter)) != null) {
+				SwingUtilities.invokeLater(new Runnable() {
+
+					@Override
+					public void run() {
+						fireOrderClosed(id, own, baseAssetType, counterAssetType, quantity, price);
+					}
+
+				});
+			}
 		}
 
 		@Override
 		protected void tickerChanged(int base, int counter, final long last, final long bid, final long ask, final long low, final long high, final long volume) {
-			SwingUtilities.invokeLater(new Runnable() {
+			final AssetType baseAssetType, counterAssetType;
+			if ((baseAssetType = AssetType.forCode(base)) != null && (counterAssetType = AssetType.forCode(counter)) != null) {
+				SwingUtilities.invokeLater(new Runnable() {
 
-				@Override
-				public void run() {
-					tickerPanel.update(last, bid, ask, low, high, volume);
-				}
+					@Override
+					public void run() {
+						fireTickerChanged(baseAssetType, counterAssetType, last, bid, ask, low, high, volume);
+					}
 
-			});
+				});
+			}
 		}
 
 		@Override
@@ -1228,6 +1674,7 @@ public class SwingClient extends JPanel {
 
 	};
 
+	final JComboBox marketComboBox;
 	final TickerPanel tickerPanel;
 	final BalancesPanel balancesPanel;
 
@@ -1236,65 +1683,154 @@ public class SwingClient extends JPanel {
 	final AuthPanel authPanel;
 	final TradePanel tradePanel;
 
-	AssetType base = AssetType.XBT, counter = AssetType.GBP;
+	AssetType.Pair market;
+	boolean authenticated;
 
 	public SwingClient() {
-		super(new BorderLayout());
-		setCursor(Cursor.getPredefinedCursor(Cursor.WAIT_CURSOR));
-		add(tickerPanel = new TickerPanel(), BorderLayout.PAGE_START);
-		add(balancesPanel = new BalancesPanel(), BorderLayout.PAGE_END);
-		add(cardPanel = new JPanel(cardLayout = new CardLayout()), BorderLayout.CENTER);
+		super(null);
+		marketComboBox = new JComboBox(new AssetType.Pair[] { new AssetType.Pair(AssetType.XBT, AssetType.EUR), new AssetType.Pair(AssetType.XBT, AssetType.GBP), new AssetType.Pair(AssetType.XBT, AssetType.USD), new AssetType.Pair(AssetType.XBT, AssetType.PLN) });
+		marketComboBox.setSelectedIndex(1);
+		tickerPanel = new TickerPanel();
+		balancesPanel = new BalancesPanel();
+		cardPanel = new JPanel(cardLayout = new CardLayout());
 		cardPanel.add(authPanel = new AuthPanel(), authPanel.getClass().getSimpleName());
 		cardPanel.add(tradePanel = new TradePanel(), tradePanel.getClass().getSimpleName());
-		new Thread() {
+
+		final ActionListener marketActionListener = new ActionListener() {
 
 			@Override
-			public void run() {
-				try {
-					coinfloor.connect(URI.create("ws://api.coinfloor.co.uk/"));
-					SwingUtilities.invokeLater(new Runnable() {
-
-						@Override
-						public void run() {
-							setCursor(null);
-							authPanel.authenticateButton.setEnabled(true);
-						}
-
-					});
-					coinfloor.watchTickerAsync(base.code, counter.code, true, new SwingCallback<TickerInfo>(SwingClient.this, "Failed to subscribe to ticker.") {
-
-						@Override
-						void completed(TickerInfo ticker) {
-							tickerPanel.update(ticker.last, ticker.bid, ticker.ask, ticker.low, ticker.high, ticker.volume);
-						}
-
-					});
-					coinfloor.watchOrdersAsync(base.code, counter.code, true, new SwingCallback<Map<Long, OrderInfo>>(SwingClient.this, "Failed to subscribe to orders.") {
-
-						@Override
-						void completed(Map<Long, OrderInfo> orders) {
-							for (Map.Entry<Long, OrderInfo> entry : orders.entrySet()) {
-								OrderInfo info = entry.getValue();
-								tradePanel.ordersPanel.addOrder(entry.getKey(), info.price, info.quantity, 0, info.quantity);
-							}
-						}
-
-					});
-				}
-				catch (final IOException e) {
-					SwingUtilities.invokeLater(new Runnable() {
-
-						@Override
-						public void run() {
-							setCursor(null);
-							JOptionPane.showMessageDialog(SwingClient.this, "Failed to connect to Coinfloor server.\n\n" + e, "Connection Failed", JOptionPane.ERROR_MESSAGE);
-						}
-
-					});
-				}
+			public void actionPerformed(ActionEvent e) {
+				setMarket((AssetType.Pair) marketComboBox.getSelectedItem());
 			}
 
-		}.start();
+		};
+		marketComboBox.addActionListener(marketActionListener);
+
+		GroupLayout layout = new GroupLayout(this);
+		layout.setAutoCreateGaps(true);
+		// @formatter:off
+		layout.setHorizontalGroup(layout.createParallelGroup()
+				.addComponent(marketComboBox, Alignment.TRAILING, GroupLayout.DEFAULT_SIZE, GroupLayout.DEFAULT_SIZE, GroupLayout.PREFERRED_SIZE)
+				.addComponent(tickerPanel)
+				.addComponent(cardPanel)
+				.addComponent(balancesPanel));
+		layout.setVerticalGroup(layout.createSequentialGroup()
+				.addComponent(marketComboBox)
+				.addPreferredGap(ComponentPlacement.UNRELATED)
+				.addComponent(tickerPanel)
+				.addComponent(cardPanel)
+				.addComponent(balancesPanel));
+		// @formatter:on
+		setLayout(layout);
+
+		new SwingTask<Void>(this, "Failed to connect to Coinfloor server.") {
+
+			@Override
+			public Void call() throws IOException {
+				coinfloor.connect();
+				return null;
+			}
+
+			@Override
+			void after() {
+				super.after();
+				authPanel.authenticateButton.setEnabled(true);
+				market = null;
+				marketActionListener.actionPerformed(null);
+			}
+
+		}.execute(executor);
+	}
+
+	public final void addBalanceListener(BalanceListener balanceListener) {
+		listenerList.add(BalanceListener.class, balanceListener);
+	}
+
+	public final void removeBalanceListener(BalanceListener balanceListener) {
+		listenerList.remove(BalanceListener.class, balanceListener);
+	}
+
+	public final BalanceListener[] getBalanceListeners() {
+		return listenerList.getListeners(BalanceListener.class);
+	}
+
+	protected final void fireBalanceChanged(AssetType assetType, long balance) {
+		BalanceListener[] balanceListeners = getBalanceListeners();
+		if (balanceListeners.length > 0) {
+			for (BalanceListener balanceListener : balanceListeners) {
+				balanceListener.balanceChanged(assetType, balance);
+			}
+		}
+	}
+
+	public final void addOrderListener(OrderListener orderListener) {
+		listenerList.add(OrderListener.class, orderListener);
+	}
+
+	public final void removeOrderListener(OrderListener orderListener) {
+		listenerList.remove(OrderListener.class, orderListener);
+	}
+
+	public final OrderListener[] getOrderListeners() {
+		return listenerList.getListeners(OrderListener.class);
+	}
+
+	protected final void fireOrderOpened(long id, boolean own, AssetType base, AssetType counter, long quantity, long price) {
+		OrderListener[] orderListeners = getOrderListeners();
+		if (orderListeners.length > 0) {
+			for (OrderListener orderListener : orderListeners) {
+				orderListener.orderOpened(id, own, base, counter, quantity, price);
+			}
+		}
+	}
+
+	protected final void fireOrderMatched(long id, boolean own, AssetType base, AssetType counter, long quantity, long remaining) {
+		OrderListener[] orderListeners = getOrderListeners();
+		if (orderListeners.length > 0) {
+			for (OrderListener orderListener : orderListeners) {
+				orderListener.orderMatched(id, own, base, counter, quantity, remaining);
+			}
+		}
+	}
+
+	protected final void fireOrderClosed(long id, boolean own, AssetType base, AssetType counter, long quantity, long price) {
+		OrderListener[] orderListeners = getOrderListeners();
+		if (orderListeners.length > 0) {
+			for (OrderListener orderListener : orderListeners) {
+				orderListener.orderClosed(id, own, base, counter, quantity, price);
+			}
+		}
+	}
+
+	public final void addTickerListener(TickerListener tickerListener) {
+		listenerList.add(TickerListener.class, tickerListener);
+	}
+
+	public final void removeTickerListener(TickerListener tickerListener) {
+		listenerList.remove(TickerListener.class, tickerListener);
+	}
+
+	public final TickerListener[] getTickerListeners() {
+		return listenerList.getListeners(TickerListener.class);
+	}
+
+	protected final void fireTickerChanged(AssetType base, AssetType counter, long last, long bid, long ask, long low, long high, long volume) {
+		TickerListener[] tickerListeners = getTickerListeners();
+		if (tickerListeners.length > 0) {
+			for (TickerListener tickerListener : tickerListeners) {
+				tickerListener.tickerChanged(base, counter, last, bid, ask, low, high, volume);
+			}
+		}
+	}
+
+	void setMarket(AssetType.Pair market) {
+		assert SwingUtilities.isEventDispatchThread();
+		firePropertyChange("market", this.market, this.market = market);
+	}
+
+	void setAuthenticated(boolean authenticated) {
+		assert SwingUtilities.isEventDispatchThread();
+		firePropertyChange("authenticated", this.authenticated, this.authenticated = authenticated);
 	}
 
 	public static void main(String[] args) throws Exception {
@@ -1307,7 +1843,7 @@ public class SwingClient extends JPanel {
 				}
 				catch (Exception ignored) {
 				}
-				JFrame frame = new JFrame("Coinfloor");
+				JFrame frame = new JFrame("Coinfloor Trader");
 				frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
 				frame.setLocationByPlatform(true);
 				frame.add(new SwingClient());
@@ -1316,6 +1852,16 @@ public class SwingClient extends JPanel {
 			}
 
 		});
+	}
+
+	static BigDecimal getAmount(JTextComponent component) {
+		try {
+			String str = component.getText();
+			return str.isEmpty() ? null : new BigDecimal(str);
+		}
+		catch (Exception e) {
+			return null;
+		}
 	}
 
 }

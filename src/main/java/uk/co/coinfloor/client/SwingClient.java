@@ -97,7 +97,7 @@ public class SwingClient extends JPanel {
 
 	}
 
-	static abstract class SwingCallback<V> implements Callback<V> {
+	static class SwingCallback<V> implements Callback<V> {
 
 		final Component parent;
 		final String errorPreamble;
@@ -131,7 +131,8 @@ public class SwingClient extends JPanel {
 			});
 		}
 
-		abstract void completed(V result);
+		void completed(V result) {
+		}
 
 		void failed(Exception exception) {
 			JOptionPane.showMessageDialog(parent, errorPreamble == null ? exception.toString() : errorPreamble + "\n\n" + exception, "Error", JOptionPane.WARNING_MESSAGE);
@@ -931,14 +932,7 @@ public class SwingClient extends JPanel {
 						return;
 					}
 					final long price = getAmount(priceField).movePointRight(market.counter.scale).longValue();
-					SwingCallback<Long> callback = new SwingCallback<Long>(LimitOrderPanel.this, "Failed to submit limit order.") {
-
-						@Override
-						void completed(Long orderID) {
-							tradePanel.myOrdersPanel.addOrder(orderID, price, fQuantity, 0, fQuantity);
-						}
-
-					};
+					SwingCallback<Long> callback = new SwingCallback<Long>(LimitOrderPanel.this, "Failed to submit limit order.");
 					submitButton.setEnabled(false);
 					try {
 						coinfloor.placeLimitOrderAsync(market.base.code, market.counter.code, fQuantity, price, 0, !cancelOnDisconnectCheckBox.isSelected(), callback);

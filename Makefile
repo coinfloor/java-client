@@ -1,16 +1,17 @@
+SRCDIR := src/main/java
 LIBDIR := ..
-OUTDIR := out
+OUTDIR := target
 
 JAVAC := javac
-JAVAC_OPTS := -source 1.6 -target 1.6 -Xlint:all $(JAVAC_OPTS)
+JAVAC_OPTS := -source 1.6 -target 1.6 $(JAVAC_OPTS)
 JAR := jar
 
 NAME := coinfloor-client
-PACKAGES := uk
 MAINCLASS := uk.co.coinfloor.client.SwingClient
-LIBRARIES := $(strip \
-	$(wildcard $(LIBDIR)/coinfloor-library-*.jar) $(wildcard $(LIBDIR)/coinfloor-library.jar) \
-	)
+LIBRARIES := $(wildcard $(addprefix $(LIBDIR)/, \
+	bcprov-jdk15on-*.jar bcprov-jdk15on.jar \
+	coinfloor-library-*.jar coinfloor-library.jar \
+	))
 
 EMPTY :=
 SPACE := $(EMPTY) $(EMPTY)
@@ -32,11 +33,9 @@ all : $(JARFILE)
 clean :
 	rm -rf '$(OUTDIR)'
 
-$(OUTDIR) :
-	mkdir -p '$(OUTDIR)'
-
-$(JARFILE) : $(OUTDIR) $(shell find $(PACKAGES))
-	rm -rf $(addprefix '$(OUTDIR)'/,$(PACKAGES))
-	find $(PACKAGES) -name '*.java' -print0 | xargs -0 -r $(JAVAC) $(JAVAC_OPTS) -d '$(OUTDIR)' -cp '$(CLASSPATH)'
+$(JARFILE) : $(shell find '$(SRCDIR)' -type d -o -name '*.java')
+	rm -rf '$(OUTDIR)'
+	mkdir -p '$(OUTDIR)/classes'
+	find '$(SRCDIR)' -name '*.java' -print0 | xargs -0 -r $(JAVAC) $(JAVAC_OPTS) -sourcepath '$(SRCDIR)' -d '$(OUTDIR)/classes' -cp '$(CLASSPATH)'
 	echo 'Class-Path: $(subst $(LIBDIR)/,,$(LIBRARIES))' > '$(OUTDIR)/Manifest'
-	$(JAR) -cfme '$(JARFILE)' '$(OUTDIR)/Manifest' '$(MAINCLASS)' -C '$(OUTDIR)' $(PACKAGES)
+	$(JAR) -cfme '$(JARFILE)' '$(OUTDIR)/Manifest' '$(MAINCLASS)' -C '$(OUTDIR)/classes' .

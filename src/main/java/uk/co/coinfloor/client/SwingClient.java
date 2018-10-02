@@ -18,6 +18,8 @@ import java.beans.PropertyChangeListener;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.EventListener;
@@ -35,7 +37,6 @@ import javax.swing.ButtonGroup;
 import javax.swing.GroupLayout;
 import javax.swing.GroupLayout.Alignment;
 import javax.swing.GroupLayout.Group;
-import javax.swing.GroupLayout.ParallelGroup;
 import javax.swing.GroupLayout.SequentialGroup;
 import javax.swing.JButton;
 import javax.swing.JCheckBox;
@@ -57,6 +58,8 @@ import javax.swing.SortOrder;
 import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
 import javax.swing.UIManager;
+import javax.swing.event.ChangeEvent;
+import javax.swing.event.ChangeListener;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
 import javax.swing.event.ListSelectionEvent;
@@ -362,12 +365,10 @@ public class SwingClient extends JPanel {
 		public void addNotify() {
 			super.addNotify();
 			addBalanceListener(this);
-			SwingClient.this.addPropertyChangeListener("authenticated", this);
 		}
 
 		@Override
 		public void removeNotify() {
-			SwingClient.this.removePropertyChangeListener("authenticated", this);
 			removeBalanceListener(this);
 			super.removeNotify();
 		}
@@ -387,14 +388,6 @@ public class SwingClient extends JPanel {
 			label.setText(balance < 0 ? "\u2014" : assetType.format(BigDecimal.valueOf(balance, assetType.scale)));
 		}
 
-		@Override
-		public void propertyChange(PropertyChangeEvent evt) {
-			super.propertyChange(evt);
-			if (evt.getPropertyName() == "authenticated" && (Boolean) evt.getNewValue()) {
-				subscribe(market);
-			}
-		}
-
 		void reset() {
 			baseBalanceLabel.setText("\u2014");
 			counterBalanceLabel.setText("\u2014");
@@ -411,23 +404,21 @@ public class SwingClient extends JPanel {
 		}
 
 		void subscribe(AssetType.Pair market) {
-			if (authenticated) {
-				SwingCallback<Map<Integer, Long>> callback = new SwingCallback<Map<Integer, Long>>(this, "Failed to retrieve balances.") {
+			SwingCallback<Map<Integer, Long>> callback = new SwingCallback<Map<Integer, Long>>(this, "Failed to retrieve balances.") {
 
-					@Override
-					void completed(Map<Integer, Long> balances) {
-						for (Map.Entry<Integer, Long> entry : balances.entrySet()) {
-							balanceChanged(AssetType.forCode(entry.getKey()), entry.getValue());
-						}
+				@Override
+				void completed(Map<Integer, Long> balances) {
+					for (Map.Entry<Integer, Long> entry : balances.entrySet()) {
+						balanceChanged(AssetType.forCode(entry.getKey()), entry.getValue());
 					}
+				}
 
-				};
-				try {
-					coinfloor.getBalancesAsync(callback);
-				}
-				catch (IOException e) {
-					callback.failed(e);
-				}
+			};
+			try {
+				coinfloor.getBalancesAsync(callback);
+			}
+			catch (IOException e) {
+				callback.failed(e);
 			}
 		}
 
@@ -439,12 +430,17 @@ public class SwingClient extends JPanel {
 
 	class AuthPanel extends JPanel {
 
+		final JComboBox uriComboBox;
 		final JTextField userIDField;
 		final JPasswordField cookieField, passphraseField;
-		final JButton authenticateButton;
+		final JButton connectButton;
 
 		AuthPanel() {
 			super(null);
+
+			JLabel uriLabel = new JLabel("URI:");
+			uriLabel.setLabelFor(uriComboBox = new JComboBox(new Object[] { "wss://api.coinfloor.co.uk/", "wss://api.cfe.gi/" }));
+			uriComboBox.setEditable(true);
 
 			JLabel userIDLabel = new JLabel("User ID:");
 			userIDLabel.setLabelFor(userIDField = new JTextField(10));
@@ -455,14 +451,22 @@ public class SwingClient extends JPanel {
 			JLabel passphraseLabel = new JLabel("Passphrase:");
 			passphraseLabel.setLabelFor(passphraseField = new JPasswordField(20));
 
-			authenticateButton = new JButton("Authenticate");
-			authenticateButton.setEnabled(false);
+			connectButton = new JButton("Connect");
 
-			authenticateButton.addActionListener(new ActionListener() {
+			connectButton.addActionListener(new ActionListener() {
 
 				@Override
 				public void actionPerformed(ActionEvent event) {
-					long userID;
+					final URI uri;
+					try {
+						uri = new URI((String) uriComboBox.getSelectedItem());
+					}
+					catch (URISyntaxException e) {
+						JOptionPane.showMessageDialog(AuthPanel.this, "Invalid URI.", "Error", JOptionPane.WARNING_MESSAGE);
+						uriComboBox.requestFocusInWindow();
+						return;
+					}
+					final long userID;
 					try {
 						userID = Long.parseLong(userIDField.getText());
 					}
@@ -471,35 +475,64 @@ public class SwingClient extends JPanel {
 						userIDField.requestFocusInWindow();
 						return;
 					}
-					String cookie = new String(cookieField.getPassword());
+					final String cookie = new String(cookieField.getPassword());
 					if (cookie.isEmpty()) {
 						JOptionPane.showMessageDialog(AuthPanel.this, "Cookie is required.", "Error", JOptionPane.WARNING_MESSAGE);
 						cookieField.requestFocusInWindow();
 						return;
 					}
-					String passphrase = new String(passphraseField.getPassword());
-					authenticateButton.setEnabled(false);
-					SwingCallback<Void> callback = new SwingCallback<Void>(AuthPanel.this, "Authentication failed.") {
+					final String passphrase = new String(passphraseField.getPassword());
+					uriComboBox.setEnabled(false);
+					userIDField.setEnabled(false);
+					cookieField.setEnabled(false);
+					passphraseField.setEnabled(false);
+					connectButton.setEnabled(false);
+					new SwingTask<Void>(AuthPanel.this, "Failed to connect to Coinfloor server.") {
+
+						@Override
+						public Void call() throws IOException {
+							if (!connected) {
+								coinfloor.connect(uri);
+							}
+							coinfloor.authenticateAsync(userID, cookie, passphrase, new SwingCallback<Void>(AuthPanel.this, "Authentication failed.") {
+
+								@Override
+								void completed(Void result) {
+									setAuthenticated(true);
+									cardLayout.next(SwingClient.this);
+								}
+
+								@Override
+								void failed(Exception exception) {
+									super.failed(exception);
+									userIDField.setEnabled(true);
+									cookieField.setEnabled(true);
+									passphraseField.setEnabled(true);
+									connectButton.setEnabled(true);
+								}
+
+							});
+							return null;
+						}
 
 						@Override
 						void completed(Void result) {
-							setAuthenticated(true);
-							cardLayout.next(cardPanel);
+							super.completed(result);
+							setConnected(true);
+							connectButton.setText("Authenticate");
 						}
 
 						@Override
 						void failed(Exception exception) {
-							authenticateButton.setEnabled(true);
 							super.failed(exception);
+							uriComboBox.setEnabled(true);
+							userIDField.setEnabled(true);
+							cookieField.setEnabled(true);
+							passphraseField.setEnabled(true);
+							connectButton.setEnabled(true);
 						}
 
-					};
-					try {
-						coinfloor.authenticateAsync(userID, cookie, passphrase, callback);
-					}
-					catch (IOException e) {
-						callback.failed(e);
-					}
+					}.execute(executor);
 				}
 
 			});
@@ -510,17 +543,23 @@ public class SwingClient extends JPanel {
 			layout.setHorizontalGroup(layout.createSequentialGroup()
 					.addContainerGap(GroupLayout.DEFAULT_SIZE, Integer.MAX_VALUE)
 					.addGroup(layout.createParallelGroup(Alignment.TRAILING)
+							.addComponent(uriLabel)
 							.addComponent(userIDLabel)
 							.addComponent(cookieLabel)
 							.addComponent(passphraseLabel))
 					.addGroup(layout.createParallelGroup()
+							.addComponent(uriComboBox, GroupLayout.DEFAULT_SIZE, GroupLayout.DEFAULT_SIZE, GroupLayout.PREFERRED_SIZE)
 							.addComponent(userIDField, GroupLayout.DEFAULT_SIZE, GroupLayout.DEFAULT_SIZE, GroupLayout.PREFERRED_SIZE)
 							.addComponent(cookieField, GroupLayout.DEFAULT_SIZE, GroupLayout.DEFAULT_SIZE, GroupLayout.PREFERRED_SIZE)
 							.addComponent(passphraseField, GroupLayout.DEFAULT_SIZE, GroupLayout.DEFAULT_SIZE, GroupLayout.PREFERRED_SIZE)
-							.addComponent(authenticateButton))
+							.addComponent(connectButton))
 					.addContainerGap(GroupLayout.DEFAULT_SIZE, Integer.MAX_VALUE));
 			layout.setVerticalGroup(layout.createSequentialGroup()
 					.addContainerGap(GroupLayout.DEFAULT_SIZE, Integer.MAX_VALUE)
+					.addGroup(layout.createBaselineGroup(false, false)
+							.addComponent(uriLabel)
+							.addComponent(uriComboBox))
+					.addPreferredGap(ComponentPlacement.UNRELATED)
 					.addGroup(layout.createBaselineGroup(false, false)
 							.addComponent(userIDLabel)
 							.addComponent(userIDField))
@@ -533,63 +572,123 @@ public class SwingClient extends JPanel {
 							.addComponent(passphraseLabel)
 							.addComponent(passphraseField))
 					.addPreferredGap(ComponentPlacement.UNRELATED)
-					.addComponent(authenticateButton)
+					.addComponent(connectButton)
 					.addContainerGap(GroupLayout.DEFAULT_SIZE, Integer.MAX_VALUE));
 			// @formatter:on
 			setLayout(layout);
 		}
 
+		@Override
+		public void addNotify() {
+			super.addNotify();
+			userIDField.requestFocusInWindow();
+			getRootPane().setDefaultButton(connectButton);
+		}
+
 	}
 
-	class TradePanel extends JPanel {
+	class TradePanel extends JPanel implements PropertyChangeListener {
 
 		final OrderPanel orderPanel = new OrderPanel();
+		final JComboBox marketComboBox;
 		final MyOrdersPanel myOrdersPanel = new MyOrdersPanel();
 		final OrdersPanel ordersPanel = new OrdersPanel();
 
 		TradePanel() {
 			super(null);
 
+			JLabel marketLabel = new JLabel("Market:");
+			marketLabel.setLabelFor(marketComboBox = new JComboBox(new AssetType.Pair[] { new AssetType.Pair(AssetType.XBT, AssetType.EUR), new AssetType.Pair(AssetType.XBT, AssetType.GBP), new AssetType.Pair(AssetType.XBT, AssetType.USD), new AssetType.Pair(AssetType.XBT, AssetType.PLN) }));
+			marketComboBox.setSelectedItem(null);
+			marketComboBox.addActionListener(new ActionListener() {
+
+				@Override
+				public void actionPerformed(ActionEvent e) {
+					setMarket((AssetType.Pair) marketComboBox.getSelectedItem());
+				}
+
+			});
+
 			JSeparator separator = new JSeparator();
 
 			GroupLayout layout = new GroupLayout(this);
 			layout.setAutoCreateContainerGaps(true);
+			layout.setAutoCreateGaps(true);
 			// @formatter:off
 			layout.setHorizontalGroup(layout.createParallelGroup()
-					.addComponent(orderPanel)
+					.addGroup(layout.createSequentialGroup()
+							.addComponent(orderPanel)
+							.addPreferredGap(ComponentPlacement.UNRELATED)
+							.addGroup(layout.createParallelGroup(Alignment.CENTER)
+									.addComponent(marketLabel, GroupLayout.PREFERRED_SIZE, GroupLayout.PREFERRED_SIZE, GroupLayout.PREFERRED_SIZE)
+									.addComponent(marketComboBox, GroupLayout.PREFERRED_SIZE, GroupLayout.PREFERRED_SIZE, GroupLayout.PREFERRED_SIZE)))
 					.addComponent(myOrdersPanel)
 					.addComponent(separator)
 					.addComponent(ordersPanel));
 			layout.setVerticalGroup(layout.createSequentialGroup()
-					.addComponent(orderPanel)
+					.addGroup(layout.createParallelGroup(Alignment.CENTER)
+							.addComponent(orderPanel, GroupLayout.PREFERRED_SIZE, GroupLayout.PREFERRED_SIZE, GroupLayout.PREFERRED_SIZE)
+							.addGroup(layout.createSequentialGroup()
+									.addComponent(marketLabel, GroupLayout.PREFERRED_SIZE, GroupLayout.PREFERRED_SIZE, GroupLayout.PREFERRED_SIZE)
+									.addComponent(marketComboBox, GroupLayout.PREFERRED_SIZE, GroupLayout.PREFERRED_SIZE, GroupLayout.PREFERRED_SIZE)))
 					.addPreferredGap(ComponentPlacement.UNRELATED)
 					.addComponent(myOrdersPanel)
 					.addPreferredGap(ComponentPlacement.UNRELATED)
-					.addComponent(separator)
+					.addComponent(separator, GroupLayout.PREFERRED_SIZE, GroupLayout.PREFERRED_SIZE, GroupLayout.PREFERRED_SIZE)
 					.addPreferredGap(ComponentPlacement.UNRELATED)
 					.addComponent(ordersPanel));
 			// @formatter:on
 			setLayout(layout);
 		}
 
+		@Override
+		public void addNotify() {
+			super.addNotify();
+			SwingClient.this.addPropertyChangeListener("authenticated", this);
+		}
+
+		@Override
+		public void removeNotify() {
+			SwingClient.this.removePropertyChangeListener("authenticated", this);
+			super.removeNotify();
+		}
+
+		@Override
+		public void propertyChange(PropertyChangeEvent evt) {
+			if (evt.getPropertyName() == "authenticated") {
+				marketComboBox.setSelectedIndex(1);
+			}
+		}
+
 	}
 
-	class OrderPanel extends JPanel {
+	class OrderPanel extends JTabbedPane {
 
-		final MarketOrderPanel marketOrderPanel;
 		final LimitOrderPanel limitOrderPanel;
+		final MarketOrderPanel marketOrderPanel;
 
 		OrderPanel() {
-			super(null);
+			addTab("Limit Order", limitOrderPanel = new LimitOrderPanel());
+			addTab("Market Order", marketOrderPanel = new MarketOrderPanel());
 
-			JTabbedPane tabbedPane = new JTabbedPane();
-			tabbedPane.addTab("Market Order", marketOrderPanel = new MarketOrderPanel());
-			tabbedPane.addTab("Limit Order", limitOrderPanel = new LimitOrderPanel());
+			addChangeListener(new ChangeListener() {
 
-			GroupLayout layout = new GroupLayout(this);
-			layout.setHorizontalGroup(layout.createSequentialGroup().addComponent(tabbedPane));
-			layout.setVerticalGroup(layout.createSequentialGroup().addComponent(tabbedPane));
-			setLayout(layout);
+				@Override
+				public void stateChanged(ChangeEvent e) {
+					JButton defaultButton = null;
+					Component selectedComponent = getSelectedComponent();
+					if (selectedComponent == limitOrderPanel) {
+						defaultButton = limitOrderPanel.submitButton;
+						limitOrderPanel.priceField.requestFocusInWindow();
+					}
+					else if (selectedComponent == marketOrderPanel) {
+						defaultButton = marketOrderPanel.executeButton;
+						marketOrderPanel.amountField.requestFocusInWindow();
+					}
+					getRootPane().setDefaultButton(defaultButton);
+				}
+
+			});
 		}
 
 	}
@@ -678,6 +777,13 @@ public class SwingClient extends JPanel {
 						@Override
 						void completed(Long remaining) {
 							JOptionPane.showMessageDialog(MarketOrderPanel.this, "Your market order was executed.", "Market Order", JOptionPane.INFORMATION_MESSAGE);
+							executeButton.setEnabled(true);
+						}
+
+						@Override
+						void failed(Exception exception) {
+							super.failed(exception);
+							executeButton.setEnabled(true);
 						}
 
 					};
@@ -714,7 +820,8 @@ public class SwingClient extends JPanel {
 			SequentialGroup amountHGroup;
 			// @formatter:off
 			layout.setHorizontalGroup(layout.createSequentialGroup()
-					.addGroup(layout.createParallelGroup(Alignment.TRAILING)
+					.addContainerGap(GroupLayout.DEFAULT_SIZE, Integer.MAX_VALUE)
+					.addGroup(layout.createParallelGroup(Alignment.CENTER)
 							.addGroup(layout.createSequentialGroup()
 									.addComponent(buyRadioButton)
 									.addComponent(sellRadioButton)
@@ -722,7 +829,9 @@ public class SwingClient extends JPanel {
 									.addComponent(getRadioButton))
 							.addGroup(layout.createSequentialGroup()
 									.addComponent(amountLabel)
-									.addGroup(amountHGroup = layout.createSequentialGroup())))
+									.addGroup(amountHGroup = layout.createSequentialGroup())
+									.addPreferredGap(ComponentPlacement.UNRELATED)
+									.addComponent(executeButton)))
 					.addPreferredGap(ComponentPlacement.UNRELATED, GroupLayout.DEFAULT_SIZE, Integer.MAX_VALUE)
 					.addGroup(layout.createSequentialGroup()
 							.addGroup(layout.createParallelGroup(Alignment.TRAILING)
@@ -733,8 +842,7 @@ public class SwingClient extends JPanel {
 									.addComponent(estimatedQuantityLabel)
 									.addComponent(estimatedTotalLabel)
 									.addComponent(averagePriceLabel)))
-					.addPreferredGap(ComponentPlacement.UNRELATED, GroupLayout.DEFAULT_SIZE, Integer.MAX_VALUE)
-					.addComponent(executeButton));
+					.addContainerGap(GroupLayout.DEFAULT_SIZE, Integer.MAX_VALUE));
 			layout.setVerticalGroup(layout.createParallelGroup(Alignment.CENTER)
 					.addGroup(layout.createSequentialGroup()
 							.addGroup(layout.createBaselineGroup(false, false)
@@ -745,7 +853,8 @@ public class SwingClient extends JPanel {
 							.addGroup(layout.createBaselineGroup(false, false)
 									.addComponent(amountLabel)
 									.addComponent(amountSymbolLabel)
-									.addComponent(amountField)))
+									.addComponent(amountField)
+									.addComponent(executeButton)))
 					.addGroup(layout.createSequentialGroup()
 							.addGroup(layout.createBaselineGroup(false, false)
 									.addComponent(estimatedQuantityLabelLabel)
@@ -755,8 +864,7 @@ public class SwingClient extends JPanel {
 									.addComponent(estimatedTotalLabel))
 							.addGroup(layout.createBaselineGroup(false, false)
 									.addComponent(averagePriceLabelLabel)
-									.addComponent(averagePriceLabel)))
-					.addComponent(executeButton));
+									.addComponent(averagePriceLabel))));
 			// @formatter:on
 			if (amountAsset != null && amountAsset.symbolAfter) {
 				amountHGroup.addComponent(amountField, GroupLayout.DEFAULT_SIZE, GroupLayout.DEFAULT_SIZE, GroupLayout.PREFERRED_SIZE).addGap(0).addComponent(amountSymbolLabel);
@@ -802,6 +910,7 @@ public class SwingClient extends JPanel {
 				return;
 			}
 			executeButton.setEnabled(true);
+			getRootPane().setDefaultButton(executeButton);
 			timer.schedule(timerTask = new TimerTask() {
 
 				@Override
@@ -932,7 +1041,21 @@ public class SwingClient extends JPanel {
 						return;
 					}
 					final long price = getAmount(priceField).movePointRight(market.counter.scale).longValue();
-					SwingCallback<Long> callback = new SwingCallback<Long>(LimitOrderPanel.this, "Failed to submit limit order.");
+					SwingCallback<Long> callback = new SwingCallback<Long>(LimitOrderPanel.this, "Failed to submit limit order.") {
+
+						@Override
+						void completed(Long result) {
+							super.completed(result);
+							submitButton.setEnabled(true);
+						}
+
+						@Override
+						void failed(Exception exception) {
+							super.failed(exception);
+							submitButton.setEnabled(true);
+						}
+
+					};
 					submitButton.setEnabled(false);
 					try {
 						coinfloor.placeLimitOrderAsync(market.base.code, market.counter.code, fQuantity, price, 0, !cancelOnDisconnectCheckBox.isSelected(), callback);
@@ -954,37 +1077,40 @@ public class SwingClient extends JPanel {
 			SequentialGroup priceHGroup, quantityHGroup;
 			// @formatter:off
 			layout.setHorizontalGroup(layout.createSequentialGroup()
-					.addComponent(priceLabel)
-					.addGroup(priceHGroup = layout.createSequentialGroup())
-					.addPreferredGap(ComponentPlacement.UNRELATED)
-					.addComponent(quantityLabel)
-					.addGroup(quantityHGroup = layout.createSequentialGroup())
-					.addPreferredGap(ComponentPlacement.UNRELATED, GroupLayout.DEFAULT_SIZE, Integer.MAX_VALUE)
-					.addComponent(submitButton));
-			layout.setVerticalGroup(layout.createParallelGroup(Alignment.CENTER)
-					.addGroup(layout.createSequentialGroup()
-							.addGroup(layout.createBaselineGroup(false, false)
-									.addComponent(bidRadioButton)
-									.addComponent(askRadioButton))
-							.addGroup(layout.createBaselineGroup(false, false)
-									.addComponent(priceLabel)
-									.addComponent(priceSymbolLabel)
-									.addComponent(priceField)
-									.addComponent(quantityLabel)
-									.addComponent(quantitySymbolLabel)
-									.addComponent(quantityField)))
-					.addComponent(submitButton));
-			ParallelGroup priceFieldHGroup = layout.createParallelGroup(Alignment.CENTER)
-					.addGroup(layout.createSequentialGroup()
+					.addContainerGap(GroupLayout.DEFAULT_SIZE, Integer.MAX_VALUE)
+					.addGroup(layout.createParallelGroup(Alignment.CENTER)
+						.addGroup(layout.createSequentialGroup()
+								.addComponent(bidRadioButton)
+								.addComponent(askRadioButton))
+						.addGroup(layout.createSequentialGroup()
+								.addComponent(priceLabel)
+								.addGroup(priceHGroup = layout.createSequentialGroup())
+								.addPreferredGap(ComponentPlacement.UNRELATED)
+								.addComponent(quantityLabel)
+								.addGroup(quantityHGroup = layout.createSequentialGroup())
+								.addPreferredGap(ComponentPlacement.UNRELATED)
+								.addComponent(submitButton)))
+					.addContainerGap(GroupLayout.DEFAULT_SIZE, Integer.MAX_VALUE));
+			layout.setVerticalGroup(layout.createSequentialGroup()
+					.addContainerGap(GroupLayout.DEFAULT_SIZE, Integer.MAX_VALUE)
+					.addGroup(layout.createBaselineGroup(false, false)
 							.addComponent(bidRadioButton)
 							.addComponent(askRadioButton))
-					.addComponent(priceField, GroupLayout.DEFAULT_SIZE, GroupLayout.DEFAULT_SIZE, GroupLayout.PREFERRED_SIZE);
+					.addGroup(layout.createBaselineGroup(false, false)
+							.addComponent(priceLabel)
+							.addComponent(priceSymbolLabel)
+							.addComponent(priceField)
+							.addComponent(quantityLabel)
+							.addComponent(quantitySymbolLabel)
+							.addComponent(quantityField)
+							.addComponent(submitButton))
+					.addContainerGap(GroupLayout.DEFAULT_SIZE, Integer.MAX_VALUE));
 			// @formatter:on
 			if (market != null && market.counter.symbolAfter) {
-				priceHGroup.addGroup(priceFieldHGroup).addGap(0).addComponent(priceSymbolLabel);
+				priceHGroup.addComponent(priceField, GroupLayout.DEFAULT_SIZE, GroupLayout.DEFAULT_SIZE, GroupLayout.PREFERRED_SIZE).addGap(0).addComponent(priceSymbolLabel);
 			}
 			else {
-				priceHGroup.addComponent(priceSymbolLabel).addGap(0).addGroup(priceFieldHGroup);
+				priceHGroup.addComponent(priceSymbolLabel).addGap(0).addComponent(priceField, GroupLayout.DEFAULT_SIZE, GroupLayout.DEFAULT_SIZE, GroupLayout.PREFERRED_SIZE);
 			}
 			if (market != null && market.base.symbolAfter) {
 				quantityHGroup.addComponent(quantityField, GroupLayout.DEFAULT_SIZE, GroupLayout.DEFAULT_SIZE, GroupLayout.PREFERRED_SIZE).addGap(0).addComponent(quantitySymbolLabel);
@@ -1002,6 +1128,7 @@ public class SwingClient extends JPanel {
 				return;
 			}
 			submitButton.setEnabled(true);
+			getRootPane().setDefaultButton(submitButton);
 		}
 
 		@Override
@@ -1354,18 +1481,6 @@ public class SwingClient extends JPanel {
 		}
 
 		@Override
-		public void addNotify() {
-			super.addNotify();
-			SwingClient.this.addPropertyChangeListener("authenticated", this);
-		}
-
-		@Override
-		public void removeNotify() {
-			SwingClient.this.removePropertyChangeListener("authenticated", this);
-			super.removeNotify();
-		}
-
-		@Override
 		public void orderOpened(long id, boolean own, AssetType base, AssetType counter, long quantity, long price) {
 			if (own) {
 				super.orderOpened(id, own, base, counter, quantity, price);
@@ -1383,14 +1498,6 @@ public class SwingClient extends JPanel {
 		public void orderClosed(long id, boolean own, AssetType base, AssetType counter, long quantity, long price) {
 			if (own) {
 				super.orderClosed(id, own, base, counter, quantity, price);
-			}
-		}
-
-		@Override
-		public void propertyChange(PropertyChangeEvent evt) {
-			super.propertyChange(evt);
-			if (evt.getPropertyName() == "authenticated" && (Boolean) evt.getNewValue()) {
-				subscribe(market);
 			}
 		}
 
@@ -1426,27 +1533,25 @@ public class SwingClient extends JPanel {
 
 		@Override
 		void subscribe(final AssetType.Pair market) {
-			if (authenticated) {
-				SwingCallback<Map<Long, OrderInfo>> callback = new SwingCallback<Map<Long, OrderInfo>>(this, "Failed to retrieve orders.") {
+			SwingCallback<Map<Long, OrderInfo>> callback = new SwingCallback<Map<Long, OrderInfo>>(this, "Failed to retrieve orders.") {
 
-					@Override
-					void completed(Map<Long, OrderInfo> orders) {
-						removeAllOrders();
-						for (Map.Entry<Long, OrderInfo> entry : orders.entrySet()) {
-							OrderInfo info = entry.getValue();
-							if (info.base == market.base.code && info.counter == market.counter.code) {
-								addOrder(entry.getKey(), info.price, info.quantity, 0, info.quantity);
-							}
+				@Override
+				void completed(Map<Long, OrderInfo> orders) {
+					removeAllOrders();
+					for (Map.Entry<Long, OrderInfo> entry : orders.entrySet()) {
+						OrderInfo info = entry.getValue();
+						if (info.base == market.base.code && info.counter == market.counter.code) {
+							addOrder(entry.getKey(), info.price, info.quantity, 0, info.quantity);
 						}
 					}
+				}
 
-				};
-				try {
-					coinfloor.getOrdersAsync(callback);
-				}
-				catch (IOException e) {
-					callback.failed(e);
-				}
+			};
+			try {
+				coinfloor.getOrdersAsync(callback);
+			}
+			catch (IOException e) {
+				callback.failed(e);
 			}
 		}
 
@@ -1668,72 +1773,39 @@ public class SwingClient extends JPanel {
 
 	};
 
-	final JComboBox marketComboBox;
-	final TickerPanel tickerPanel;
-	final BalancesPanel balancesPanel;
-
-	final JPanel cardPanel;
 	final CardLayout cardLayout;
 	final AuthPanel authPanel;
+	final JPanel mainPanel;
+
+	final TickerPanel tickerPanel;
 	final TradePanel tradePanel;
+	final BalancesPanel balancesPanel;
 
 	AssetType.Pair market;
-	boolean authenticated;
+	boolean connected, authenticated;
 
 	public SwingClient() {
 		super(null);
-		marketComboBox = new JComboBox(new AssetType.Pair[] { new AssetType.Pair(AssetType.XBT, AssetType.EUR), new AssetType.Pair(AssetType.XBT, AssetType.GBP), new AssetType.Pair(AssetType.XBT, AssetType.USD), new AssetType.Pair(AssetType.XBT, AssetType.PLN) });
-		marketComboBox.setSelectedIndex(1);
+		setLayout(cardLayout = new CardLayout());
+		add(authPanel = new AuthPanel(), authPanel.getClass().getSimpleName());
 		tickerPanel = new TickerPanel();
+		tradePanel = new TradePanel();
 		balancesPanel = new BalancesPanel();
-		cardPanel = new JPanel(cardLayout = new CardLayout());
-		cardPanel.add(authPanel = new AuthPanel(), authPanel.getClass().getSimpleName());
-		cardPanel.add(tradePanel = new TradePanel(), tradePanel.getClass().getSimpleName());
+		add(mainPanel = new JPanel(null), "Main");
 
-		final ActionListener marketActionListener = new ActionListener() {
-
-			@Override
-			public void actionPerformed(ActionEvent e) {
-				setMarket((AssetType.Pair) marketComboBox.getSelectedItem());
-			}
-
-		};
-		marketComboBox.addActionListener(marketActionListener);
-
-		GroupLayout layout = new GroupLayout(this);
+		GroupLayout layout = new GroupLayout(mainPanel);
 		layout.setAutoCreateGaps(true);
 		// @formatter:off
 		layout.setHorizontalGroup(layout.createParallelGroup()
-				.addComponent(marketComboBox, Alignment.TRAILING, GroupLayout.DEFAULT_SIZE, GroupLayout.DEFAULT_SIZE, GroupLayout.PREFERRED_SIZE)
 				.addComponent(tickerPanel)
-				.addComponent(cardPanel)
+				.addComponent(tradePanel)
 				.addComponent(balancesPanel));
 		layout.setVerticalGroup(layout.createSequentialGroup()
-				.addComponent(marketComboBox)
-				.addPreferredGap(ComponentPlacement.UNRELATED)
-				.addComponent(tickerPanel)
-				.addComponent(cardPanel)
-				.addComponent(balancesPanel));
+				.addComponent(tickerPanel, GroupLayout.PREFERRED_SIZE, GroupLayout.PREFERRED_SIZE, GroupLayout.PREFERRED_SIZE)
+				.addComponent(tradePanel)
+				.addComponent(balancesPanel, GroupLayout.PREFERRED_SIZE, GroupLayout.PREFERRED_SIZE, GroupLayout.PREFERRED_SIZE));
 		// @formatter:on
-		setLayout(layout);
-
-		new SwingTask<Void>(this, "Failed to connect to Coinfloor server.") {
-
-			@Override
-			public Void call() throws IOException {
-				coinfloor.connect();
-				return null;
-			}
-
-			@Override
-			void after() {
-				super.after();
-				authPanel.authenticateButton.setEnabled(true);
-				market = null;
-				marketActionListener.actionPerformed(null);
-			}
-
-		}.execute(executor);
+		mainPanel.setLayout(layout);
 	}
 
 	public final void addBalanceListener(BalanceListener balanceListener) {
@@ -1820,6 +1892,11 @@ public class SwingClient extends JPanel {
 	void setMarket(AssetType.Pair market) {
 		assert SwingUtilities.isEventDispatchThread();
 		firePropertyChange("market", this.market, this.market = market);
+	}
+
+	void setConnected(boolean connected) {
+		assert SwingUtilities.isEventDispatchThread();
+		firePropertyChange("connected", this.connected, this.connected = connected);
 	}
 
 	void setAuthenticated(boolean authenticated) {
